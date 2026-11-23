@@ -16,6 +16,21 @@ from evaluator import MultimodalEvaluator
 from models.multimodal_net import AirbnbMultimodalRegressor
 
 
+def get_device() -> torch.device:
+    """Tự động lựa chọn phần cứng tối ưu: CUDA -> Apple Silicon MPS -> CPU."""
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        print(f"-> [DEVICE] Khởi động trên GPU NVIDIA: [{gpu_name}] ({vram_gb:.1f} GB VRAM)")
+        return torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        print("-> [DEVICE] Đang chạy mô hình trên thiết bị: [MPS] (Apple Silicon GPU)")
+        return torch.device("mps")
+    else:
+        print("-> [DEVICE] Chạy trên CPU.")
+        return torch.device("cpu")
+
+
 def create_mock_airbnb_data(
     cfg: ModelConfig, n_samples: int = 2000
 ) -> tuple[AirbnbMultimodalDataset, AirbnbMultimodalDataset, list[int]]:
@@ -24,7 +39,8 @@ def create_mock_airbnb_data(
 
     # 1. Sinh dữ liệu Tabular
     x_num = rng.normal(0, 1, size=(n_samples, len(cfg.num_cols))).astype(np.float32)
-    cat_cardinalities = [25, 10, 4, 2, 2]  # Số nhóm của 5 cột Categorical
+    # 6 cột phân loại: neighbourhood_cleansed, property_type, room_type, host_is_superhost, instant_bookable, city_name
+    cat_cardinalities = [25, 10, 4, 2, 2, 5]
     x_cat = np.column_stack(
         [rng.integers(0, card, size=n_samples) for card in cat_cardinalities]
     )
@@ -33,10 +49,7 @@ def create_mock_airbnb_data(
     x_txt = rng.normal(0, 1, size=(n_samples, cfg.raw_text_dim)).astype(np.float32)
     x_img = rng.normal(0, 1, size=(n_samples, cfg.raw_image_dim)).astype(np.float32)
 
-    # 3. Tạo Target y = log(price) phụ thuộc vào cả 3 luồng để kiểm định Evaluator:
-    # - Cột số 2 (accommodates) và cột số 3 (bedrooms) tác động mạnh nhất
-    # - Cột phân loại 2 (room_type) tác động mạnh
-    # - Nhánh Text và Image đều đóng góp tín hiệu thật
+    # 3. Tạo Target y = log(price) phụ thuộc vào cả 3 luồng
     tabular_signal = 0.45 * x_num[:, 2] + 0.35 * x_num[:, 3] + 0.25 * (x_cat[:, 2] == 0)
     text_signal = 0.25 * np.mean(x_txt[:, :20], axis=1)
     image_signal = 0.20 * np.mean(x_img[:, :15], axis=1)
@@ -59,15 +72,13 @@ def train_model(
     model: nn.Module,
     train_loader: DataLoader,
     cfg: ModelConfig,
-    device: torch.device | None = None,
+    device: torch.device,
 ) -> None:
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    """Vòng lặp huấn luyện tối ưu với Huber Loss chống outliers ngoại lai."""
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
-    criterion = nn.HuberLoss()
+    criterion = nn.HuberLoss(delta=1.0)
 
     model.to(device)
     model.train()
@@ -94,13 +105,7 @@ def train_model(
 def main() -> None:
     cfg = ModelConfig()
     torch.manual_seed(cfg.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        gpu_name = torch.cuda.get_device_name(0)
-        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        print(f"-> [DEVICE] Khởi động trên GPU: [{gpu_name}] ({vram_gb:.1f} GB VRAM)")
-    else:
-        print("-> [DEVICE] Không tìm thấy GPU CUDA, tự động fallback sang CPU.")
+    device = get_device()
 
     gold_dir = Path("data/gold_parquet")
     if (gold_dir / "train.parquet").exists() and (gold_dir / "train_img_emb.npy").exists():
@@ -119,7 +124,7 @@ def main() -> None:
             image_emb_npy_path=str(gold_dir / "test_img_emb.npy"),
         )
     else:
-        print("1. Chưa có dữ liệu Parquet, khởi tạo Mock Data để kiểm thử...")
+        print("1. Chưa có dữ liệu Parquet đầy đủ, khởi tạo Mock Data để kiểm thử...")
         train_ds, test_ds, cat_cards = create_mock_airbnb_data(cfg)
 
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)

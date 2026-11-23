@@ -8,24 +8,35 @@ class AirbnbSparkCleaner:
     @staticmethod
     def load_raw_listings(spark, input_path: str) -> DataFrame:
         """
-        Đọc dữ liệu thô (hỗ trợ đọc 1 file hoặc đọc hàng loạt file bằng wildcard *.csv.gz).
-        Bắt buộc bật multiLine=True vì cột description của Airbnb chứa rất nhiều ký tự xuống dòng.
+        Đọc dữ liệu thô (hỗ trợ đọc 1 file hoặc đọc hàng loạt file bằng wildcard *.csv).
+        Bắt buộc bật multiLine=True vì cột description của Airbnb chứa nhiều ký tự xuống dòng.
         """
         return (
             spark.read.option("header", "true")
             .option("multiLine", "true")
             .option("escape", '"')
             .option("quote", '"')
-            .option("inferSchema", "false")  # Đọc dạng String trước để tự ép kiểu an toàn
+            .option("inferSchema", "false")
             .csv(input_path)
         )
 
     @staticmethod
     def clean_and_extract_features(df: DataFrame) -> DataFrame:
-        """Biến đổi dữ liệu thô sang bảng Silver sạch, loại bỏ rác và trích xuất đặc trưng."""
+        """Biến đổi dữ liệu thô sang bảng Silver sạch, loại bỏ rác và trích xuất đặc trưng đa thành phố & luật thuê nhà."""
 
-        # 1. Làm sạch cột Target `price`: xóa '$' và ',', ép kiểu Double, lọc khoảng hợp lý
+        # 0. Trích xuất tên thành phố từ input_file_name() nếu chưa có
+        file_path_lower = F.lower(F.input_file_name())
         df_clean = df.withColumn(
+            "city_name",
+            F.when(file_path_lower.contains("hawaii"), F.lit("Hawaii"))
+            .when(file_path_lower.contains("london"), F.lit("London"))
+            .when(file_path_lower.contains("los_angeles"), F.lit("Los Angeles"))
+            .when(file_path_lower.contains("new_york"), F.lit("New York"))
+            .otherwise(F.lit("Other")),
+        )
+
+        # 1. Làm sạch cột Target `price`: xóa '$' và ',', ép kiểu Double, lọc khoảng hợp lý (10$ - 5000$)
+        df_clean = df_clean.withColumn(
             "price_clean",
             F.regexp_replace(F.col("price"), r"[\$,]", "").cast("double"),
         ).filter(
@@ -57,24 +68,33 @@ class AirbnbSparkCleaner:
         )
 
         # 4. Đếm số lượng tiện nghi `amenities_count` từ chuỗi JSON Array '["Wifi", "Pool"]'
-        # Thay vì parse JSON tốn CPU, ta tách mảng bằng dấu phẩy sau khi xóa ngoặc vuông
         df_clean = df_clean.withColumn(
             "amenities_count",
             F.when(
                 F.col("amenities").isNull() | (F.col("amenities") == "[]"), F.lit(0.0)
             ).otherwise(
-                F.size(F.split(F.regexp_replace(F.col("amenities"), r"[\[\]\"]", ""), ",")).cast("double")
+                F.size(
+                    F.split(
+                        F.regexp_replace(F.col("amenities"), r"[\[\]\"]", ""), ","
+                    )
+                ).cast("double")
             ),
         )
 
-        # 5. Làm sạch tỷ lệ % của Host ("98%" -> 0.98)
-        # TODO: Tạm thời không tự ý điền 0.0 vào các cột tỷ lệ host vì sẽ làm sai lệch phân phối.
-        # Sau này sẽ thu thập đủ dữ liệu hoặc áp dụng mô hình Imputation (MICE / KNN) chuyên sâu sau.
-        for rate_col in ["host_response_rate", "host_acceptance_rate"]:
-            df_clean = df_clean.withColumn(
-                rate_col,
-                F.regexp_replace(F.col(rate_col), "%", "").cast("double") / 100.0,
-            )
+        # 5. Xử lý quy định / luật lưu trú (Local Law 18 NYC, HSO LA, Bill 41 Hawaii, 90-day London):
+        # - minimum_nights_capped: Cắt trần tại 30 đêm nhằm triệt tiêu các outlier (365, 1125 đêm)
+        # - is_long_term_stay: Cờ nhị phân (1.0 nếu >= 30 đêm, 0.0 nếu < 30 đêm)
+        raw_min_nights = F.coalesce(F.col("minimum_nights").cast("double"), F.lit(1.0))
+        df_clean = df_clean.withColumn(
+            "minimum_nights_capped",
+            F.when(raw_min_nights > 30.0, F.lit(30.0))
+            .when(raw_min_nights < 1.0, F.lit(1.0))
+            .otherwise(raw_min_nights),
+        )
+        df_clean = df_clean.withColumn(
+            "is_long_term_stay",
+            F.when(raw_min_nights >= 30.0, F.lit(1.0)).otherwise(F.lit(0.0)),
+        )
 
         # 6. Ép kiểu các cột Numeric còn lại
         numeric_casts = [
@@ -83,44 +103,31 @@ class AirbnbSparkCleaner:
             "accommodates",
             "bedrooms",
             "beds",
+            "bathrooms",
+            "amenities_count",
             "calculated_host_listings_count",
-            "minimum_nights",
+            "minimum_nights_capped",
+            "is_long_term_stay",
             "number_of_reviews",
             "review_scores_rating",
         ]
         for col_name in numeric_casts:
             df_clean = df_clean.withColumn(col_name, F.col(col_name).cast("double"))
 
-        # TODO: Tạm thời bỏ qua (loại bỏ) các record bị khuyết giá trị trong dataset (Listwise Deletion).
-        # Phương pháp này bảo toàn tính chân thực của phân phối dữ liệu, tránh điền giá trị giả định (như 0.0).
-        # Sau này sẽ nghiên cứu áp dụng các kỹ thuật Imputation tối ưu hơn (MICE / KNN) để tận dụng lại các record này.
-        required_numeric_cols = [
-            "latitude",
-            "longitude",
-            "accommodates",
-            "bedrooms",
-            "beds",
-            "bathrooms",
-            "amenities_count",
-            "calculated_host_listings_count",
-            "minimum_nights",
-            "number_of_reviews",
-            "review_scores_rating",
-        ]
-        for col_name in required_numeric_cols:
+        # Lọc bỏ các dòng bị khuyết các thuộc tính số quan trọng (Listwise Deletion an toàn)
+        for col_name in numeric_casts:
             df_clean = df_clean.filter(F.col(col_name).isNotNull())
 
         # 7. Làm sạch các cột Categorical (điền 'Unknown' hoặc 'f' nếu thiếu)
-        df_clean = (
-            df_clean.fillna(
-                {
-                    "neighbourhood_cleansed": "Unknown",
-                    "property_type": "Other",
-                    "room_type": "Unknown",
-                    "host_is_superhost": "f",
-                    "instant_bookable": "f",
-                }
-            )
+        df_clean = df_clean.fillna(
+            {
+                "neighbourhood_cleansed": "Unknown",
+                "property_type": "Other",
+                "room_type": "Unknown",
+                "host_is_superhost": "f",
+                "instant_bookable": "f",
+                "city_name": "Other",
+            }
         )
 
         # 8. Làm sạch nhánh Text: Gộp name + description + neighborhood_overview và xóa thẻ HTML

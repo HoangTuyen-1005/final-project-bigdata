@@ -22,7 +22,7 @@ class SparkTabularFeaturizer:
             strategy="median",
         )
 
-        # Bước 2: Gom 13 cột số đã điền khuyết thành 1 Vector để chuẩn hóa đồng loạt
+        # Bước 2: Gom 12 cột số đã điền khuyết thành 1 Vector để chuẩn hóa đồng loạt
         assembler = VectorAssembler(
             inputCols=self.imputed_num_cols,
             outputCol="num_features_raw_vec",
@@ -37,7 +37,7 @@ class SparkTabularFeaturizer:
             withStd=True,
         )
 
-        # Bước 4: Mã hóa 5 cột chữ sang chỉ số nguyên (0, 1, 2...).
+        # Bước 4: Mã hóa 6 cột chữ sang chỉ số nguyên (0, 1, 2...).
         # handleInvalid="keep" tự động gán các nhãn mới (Unseen labels ở tập Test) vào 1 bucket riêng!
         indexers = [
             StringIndexer(

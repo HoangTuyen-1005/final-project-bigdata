@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Báo Cáo Đánh Giá Mô Hình Đa Phương Thức Airbnb</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #f8fafc;
+      color: #1e293b;
+      margin: 0;
+      padding: 24px;
+    }
+
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+
+    h1 {
+      color: #0f172a;
+      font-size: 24px;
+      margin-bottom: 8px;
+    }
+
+    p.subtitle {
+      color: #64748b;
+      margin-top: 0;
+      margin-bottom: 24px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));
+      gap: 24px;
+      margin-bottom: 24px;
+    }
+
+    .card {
+      background: #ffffff;
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+      border: 1px solid #e2e8f0;
+    }
+
+    .card-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: #334155;
+      margin-bottom: 16px;
+    }
+
+    .stats-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .stat-box {
+      background: white;
+      border-radius: 8px;
+      padding: 16px;
+      border: 1px solid #e2e8f0;
+      text-align: center;
+    }
+
+    .stat-val {
+      font-size: 26px;
+      font-weight: 800;
+      color: #2563eb;
+    }
+
+    .stat-label {
+      font-size: 13px;
+      color: #64748b;
+      margin-top: 4px;
+      font-weight: 500;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 14px;
+    }
+
+    th,
+    td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid #e2e8f0;
+    }
+
+    th {
+      background: #f1f5f9;
+      color: #475569;
+      font-weight: 600;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .badge-num {
+      background: #e0f2fe;
+      color: #0369a1;
+    }
+
+    .badge-cat {
+      background: #fef3c7;
+      color: #b45309;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <h1>Báo Cáo Đánh Giá Mô Hình Đa Phương Thức Đa Thành Phố (Airbnb Pricing)</h1>
+    <p class="subtitle">Thực nghiệm trên tập kiểm thử 3,187 mẫu (New York, Los Angeles, Hawaii, London) | Kiến trúc:
+      FT-Transformer + CLIP + E5 + Gated Fusion</p>
+
+    <div class="stats-row">
+      <div class="stat-box">
+        <div class="stat-val">0.3671</div>
+        <div class="stat-label">Baseline Test RMSE</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-val" style="color: #ec4899;">56.88%</div>
+        <div class="stat-label">Image Gate (&alpha;<sub>img</sub>)</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-val" style="color: #3b82f6;">23.30%</div>
+        <div class="stat-label">Tabular Gate (&alpha;<sub>tab</sub>)</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-val" style="color: #10b981;">19.82%</div>
+        <div class="stat-label">Text Gate (&alpha;<sub>txt</sub>)</div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="card-title">Ý 3: Phân Bổ Trọng Số Cổng Gated Fusion (%)</div>
+        <canvas id="gateChart" height="200"></canvas>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Ý 3: Modality Permutation Importance (&Delta;RMSE)</div>
+        <canvas id="modalityChart" height="200"></canvas>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="card-title">Ý 2: Top 8 Features Tác Động Mạnh Nhất Lên Giá (&Delta;RMSE)</div>
+        <canvas id="fieldChart" height="260"></canvas>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Bảng Chi Tiết Top Features Đa Thành Phố</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Tên Field</th>
+              <th>Loại dữ liệu</th>
+              <th>&Delta;RMSE</th>
+              <th>Ý nghĩa thực tế</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>minimum_nights_capped</b></td>
+              <td><span class="badge badge-num">Numeric</span></td>
+              <td><b>+0.0690</b></td>
+              <td>Quy chuẩn trần luật lưu trú 30 ngày (NYC Law 18, LA HSO)</td>
+            </tr>
+            <tr>
+              <td><b>neighbourhood_cleansed</b></td>
+              <td><span class="badge badge-cat">Categorical</span></td>
+              <td>+0.0550</td>
+              <td>Khu vực vi mô / phường xã trong từng thành phố</td>
+            </tr>
+            <tr>
+              <td><b>city_name</b></td>
+              <td><span class="badge badge-cat">Categorical</span></td>
+              <td><b>+0.0533</b></td>
+              <td>Ngữ cảnh địa lý vĩ mô & chính sách riêng 4 thị trường</td>
+            </tr>
+            <tr>
+              <td><b>bedrooms</b></td>
+              <td><span class="badge badge-num">Numeric</span></td>
+              <td>+0.0507</td>
+              <td>Số lượng phòng ngủ thực tế của căn hộ</td>
+            </tr>
+            <tr>
+              <td><b>accommodates</b></td>
+              <td><span class="badge badge-num">Numeric</span></td>
+              <td>+0.0455</td>
+              <td>Sức chứa số lượng khách lưu trú tối đa</td>
+            </tr>
+            <tr>
+              <td><b>bathrooms</b></td>
+              <td><span class="badge badge-num">Numeric</span></td>
+              <td>+0.0209</td>
+              <td>Số phòng tắm tiện nghi sẵn có</td>
+            </tr>
+            <tr>
+              <td><b>is_long_term_stay</b></td>
+              <td><span class="badge badge-num">Numeric</span></td>
+              <td><b>+0.0206</b></td>
+              <td>Cờ nhị phân phân loại hợp đồng dài hạn (&ge;30 đêm)</td>
+            </tr>
+            <tr>
+              <td><b>room_type</b></td>
+              <td><span class="badge badge-cat">Categorical</span></td>
+              <td>+0.0204</td>
+              <td>Loại phòng: Toàn bộ căn hộ vs Phòng riêng vs Ở ghép</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // 1. Gate Chart
+    new Chart(document.getElementById('gateChart'), {
+      type: 'doughnut',
+      data: {
+        labels: ['Image Gate (56.88%)', 'Tabular Gate (23.30%)', 'Text Gate (19.82%)'],
+        datasets: [{
+          data: [56.88, 23.30, 19.82],
+          backgroundColor: ['#ec4899', '#3b82f6', '#10b981']
+        }]
+      },
+      options: { responsive: true, plugins: { legend: { position: 'bottom' } } }
+    });
+
+    // 2. Modality Permutation Chart
+    new Chart(document.getElementById('modalityChart'), {
+      type: 'bar',
+      data: {
+        labels: ['Tabular (12 num + 6 cat)', 'Image Branch', 'Text Branch'],
+        datasets: [{
+          label: 'Delta RMSE khi xáo trộn',
+          data: [0.4175, 0.0883, 0.0723],
+          backgroundColor: ['#3b82f6', '#ec4899', '#10b981']
+        }]
+      },
+      options: {
+        responsive: true,
+        scales: { y: { beginAtZero: true, title: { display: true, text: 'Delta RMSE (Càng cao càng quan trọng)' } } }
+      }
+    });
+
+    // 3. Field Permutation Chart
+    new Chart(document.getElementById('fieldChart'), {
+      type: 'bar',
+      data: {
+        labels: [
+          'minimum_nights_capped',
+          'neighbourhood_cleansed',
+          'city_name',
+          'bedrooms',
+          'accommodates',
+          'bathrooms',
+          'is_long_term_stay',
+          'room_type'
+        ],
+        datasets: [{
+          label: 'Delta RMSE',
+          data: [0.0690, 0.0550, 0.0533, 0.0507, 0.0455, 0.0209, 0.0206, 0.0204],
+          backgroundColor: '#6366f1'
+        }]
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        scales: { x: { beginAtZero: true, title: { display: true, text: 'Delta RMSE' } } }
+      }
+    });
+  </script>
+</body>
+
+</html>

@@ -61,12 +61,12 @@ class MultimodalEvaluator:
         n_samples = self.y_true.size(0)
         results = []
 
-        for modality in ["Tabular (All 18 cols)", "Text Branch", "Image Branch"]:
+        for modality in ["Tabular (12 num + 6 cat)", "Text Branch", "Image Branch"]:
             deltas = []
             for _ in range(n_repeats):
                 perm_idx = torch.randperm(n_samples, device=self.device)
 
-                if modality == "Tabular (All 18 cols)":
+                if modality == "Tabular (12 num + 6 cat)":
                     shuffled_rmse, _ = self._compute_rmse(
                         self.x_num[perm_idx], self.x_cat[perm_idx], self.x_txt, self.x_img
                     )
