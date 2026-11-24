@@ -1,9 +1,14 @@
-import json
-import sys
-from pathlib import Path
+"""Train and evaluate FT-Transformer + E5 + CLIP gated multimodal model.
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
+Default mode is real data ONLY; synthetic smoke data requires --mode mock.
+"""
+from __future__ import annotations
+
+import argparse
+from dataclasses import replace
+import json
+import random
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -14,139 +19,234 @@ from config import ModelConfig
 from dataset import AirbnbMultimodalDataset
 from evaluator import MultimodalEvaluator
 from models.multimodal_net import AirbnbMultimodalRegressor
+from project_state import load_state
 
 
-def create_mock_airbnb_data(
-    cfg: ModelConfig, n_samples: int = 2000
-) -> tuple[AirbnbMultimodalDataset, AirbnbMultimodalDataset, list[int]]:
-    """Tạo dữ liệu giả lập có quy luật nhân quả thực tế để kiểm chứng pipeline."""
+def create_mock_airbnb_data(cfg: ModelConfig, n_samples: int = 600):
     rng = np.random.default_rng(cfg.seed)
-
-    # 1. Sinh dữ liệu Tabular
-    x_num = rng.normal(0, 1, size=(n_samples, len(cfg.num_cols))).astype(np.float32)
-    cat_cardinalities = [25, 10, 4, 2, 2]  # Số nhóm của 5 cột Categorical
-    x_cat = np.column_stack(
-        [rng.integers(0, card, size=n_samples) for card in cat_cardinalities]
-    )
-
-    # 2. Sinh Embeddings cho Text (768 chiều) và Image (512 chiều)
-    x_txt = rng.normal(0, 1, size=(n_samples, cfg.raw_text_dim)).astype(np.float32)
-    x_img = rng.normal(0, 1, size=(n_samples, cfg.raw_image_dim)).astype(np.float32)
-
-    # 3. Tạo Target y = log(price) phụ thuộc vào cả 3 luồng để kiểm định Evaluator:
-    # - Cột số 2 (accommodates) và cột số 3 (bedrooms) tác động mạnh nhất
-    # - Cột phân loại 2 (room_type) tác động mạnh
-    # - Nhánh Text và Image đều đóng góp tín hiệu thật
-    tabular_signal = 0.45 * x_num[:, 2] + 0.35 * x_num[:, 3] + 0.25 * (x_cat[:, 2] == 0)
-    text_signal = 0.25 * np.mean(x_txt[:, :20], axis=1)
-    image_signal = 0.20 * np.mean(x_img[:, :15], axis=1)
-    noise = rng.normal(0, 0.08, size=n_samples)
-
-    y = (4.5 + tabular_signal + text_signal + image_signal + noise).astype(np.float32)
-
-    # Chia Train (80%) / Test (20%)
-    split = int(n_samples * 0.8)
-    train_ds = AirbnbMultimodalDataset(
-        x_num[:split], x_cat[:split], x_txt[:split], x_img[:split], y[:split]
-    )
-    test_ds = AirbnbMultimodalDataset(
-        x_num[split:], x_cat[split:], x_txt[split:], x_img[split:], y[split:]
-    )
-    return train_ds, test_ds, cat_cardinalities
+    n_num = len(cfg.num_feature_names)
+    x_num = rng.normal(size=(n_samples, n_num)).astype(np.float32)
+    cards = [5, 25, 10, 4, 3, 3]
+    x_cat = np.stack([rng.integers(0, card, size=n_samples) for card in cards], axis=1)
+    x_txt = rng.normal(size=(n_samples, cfg.raw_text_dim)).astype(np.float32)
+    x_img = rng.normal(size=(n_samples, cfg.raw_image_dim)).astype(np.float32)
+    y = (4.5 + .45*x_num[:, 2] + .35*x_num[:, 3] + .25*(x_cat[:, 3] == 0)
+         + .2*x_txt[:, 0] + .15*x_img[:, 0] + rng.normal(0, .1, n_samples)).astype(np.float32)
+    perm = rng.permutation(n_samples)
+    def subset(idx):
+        return AirbnbMultimodalDataset(x_num[idx], x_cat[idx], x_txt[idx], x_img[idx], y[idx])
+    return subset(perm[:int(.8*n_samples)]), subset(perm[int(.8*n_samples):int(.9*n_samples)]), \
+        subset(perm[int(.9*n_samples):]), cards
 
 
-def train_model(
-    model: nn.Module,
-    train_loader: DataLoader,
-    cfg: ModelConfig,
-    device: torch.device | None = None,
-) -> None:
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def run_validation(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    loss_total, count = 0., 0
+    criterion = nn.HuberLoss(reduction="sum")
+    with torch.no_grad():
+        for batch in loader:
+            inputs = [batch[k].to(device) for k in ("x_num", "x_cat", "x_txt", "x_img")]
+            pred, _ = model(*inputs, available_mask=batch["available_mask"].to(device))
+            y = batch["y"].to(device)
+            loss_total += criterion(pred, y).item()
+            count += len(y)
+    return loss_total / count
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
-    )
+
+def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
+                cfg: ModelConfig, device: torch.device, checkpoint: Path) -> dict:
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     criterion = nn.HuberLoss()
-
     model.to(device)
-    model.train()
-
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    best_loss = float("inf")
+    best_epoch = 0
+    stale = 0
+    history = []
     for epoch in range(1, cfg.epochs + 1):
-        epoch_loss = 0.0
+        model.train()
+        train_sum = 0.0
         for batch in train_loader:
-            optimizer.zero_grad()
-            preds, _ = model(
-                batch["x_num"].to(device),
-                batch["x_cat"].to(device),
-                batch["x_txt"].to(device),
-                batch["x_img"].to(device),
-            )
-            loss = criterion(preds, batch["y"].to(device))
+            optimizer.zero_grad(set_to_none=True)
+            inputs = [batch[k].to(device) for k in ("x_num", "x_cat", "x_txt", "x_img")]
+            availability = batch["available_mask"].to(device)
+            if cfg.auxiliary_loss_weight > 0:
+                prediction, _, branches = model(*inputs, available_mask=availability,
+                                                 return_aux=True)
+            else:
+                prediction, _ = model(*inputs, available_mask=availability)
+            target = batch["y"].to(device)
+            loss = criterion(prediction, target)
+            if cfg.auxiliary_loss_weight > 0:
+                # Only supervise genuinely present, enabled branches. Never train on
+                # the all-zero placeholder for a missing embedding.
+                per_branch = torch.nn.functional.huber_loss(
+                    branches, target.unsqueeze(1).expand_as(branches), reduction="none")
+                aux_loss = (per_branch * availability).sum() / availability.sum().clamp_min(1)
+                loss = loss + cfg.auxiliary_loss_weight * aux_loss
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item() * len(batch["y"])
+            train_sum += loss.item() * len(batch["y"])
+        train_loss = train_sum / len(train_loader.dataset)
+        val_loss = run_validation(model, val_loader, device)
+        history.append({"epoch": epoch, "train_huber": train_loss, "val_huber": val_loss})
+        print(f"Epoch {epoch:02d} | train={train_loss:.5f} | val={val_loss:.5f}")
+        if val_loss < best_loss - 1e-6:
+            best_loss, best_epoch, stale = val_loss, epoch, 0
+            torch.save(model.state_dict(), checkpoint)
+        else:
+            stale += 1
+            if stale >= cfg.early_stopping_patience:
+                print("Early stopping at epoch", epoch)
+                break
+    model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
+    print(f"Restored best checkpoint from epoch {best_epoch} (val Huber={best_loss:.5f})")
+    return {"best_epoch": best_epoch, "best_val_huber": best_loss, "history": history}
 
-        if epoch % 5 == 0 or epoch == 1:
-            print(f"[Epoch {epoch:02d}/{cfg.epochs:02d}] Train Huber Loss: {epoch_loss / len(train_loader.dataset):.4f}")
+
+def ridge_tabular_baseline(train: AirbnbMultimodalDataset,
+                           test: AirbnbMultimodalDataset) -> dict:
+    """A separately fitted tabular-only baseline; one-hot avoids ordinal category misuse."""
+    from scipy.sparse import csr_matrix, hstack
+    from sklearn.linear_model import Ridge
+    from sklearn.preprocessing import OneHotEncoder
+    enc = OneHotEncoder(handle_unknown="ignore")
+    cat_train = enc.fit_transform(train.x_cat.numpy())
+    cat_test = enc.transform(test.x_cat.numpy())
+    train_x = hstack([csr_matrix(train.x_num.numpy()), cat_train], format="csr")
+    test_x = hstack([csr_matrix(test.x_num.numpy()), cat_test], format="csr")
+    estimator = Ridge(alpha=10.0, solver="lsqr")
+    estimator.fit(train_x, train.y.numpy())
+    p = estimator.predict(test_x)
+    target = test.y.numpy()
+    return {"RMSE_log": float(np.sqrt(np.mean((p-target)**2))),
+            "MAE_log": float(np.mean(np.abs(p-target)))}
 
 
 def main() -> None:
-    cfg = ModelConfig()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=["real", "mock"], default="real")
+    parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--skip-importance", action="store_true")
+    parser.add_argument("--modalities", default="tabular,text,image",
+                        help="Comma-separated nonempty subset: tabular,text,image")
+    parser.add_argument("--cohort", choices=["complete", "eligible"], default="complete",
+                        help="complete = same 3-modality rows for fair comparison")
+    parser.add_argument("--aux-loss-weight", type=float, default=0.0,
+                        help="Independent per-branch Huber auxiliary weight (default 0)")
+    parser.add_argument("--modality-dropout", type=float, default=None,
+                        help="Symmetric modality dropout probability (default 0.2)")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--skip-ridge-baseline", action="store_true")
+    args = parser.parse_args()
+    if args.epochs is not None and args.epochs < 1:
+        parser.error("--epochs must be >= 1")
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("--batch-size must be >= 1")
+    names = [x.strip().lower() for x in args.modalities.split(",")]
+    if not names or len(set(names)) != len(names) or any(
+            x not in ("tabular", "text", "image") for x in names):
+        parser.error("--modalities must be a unique comma-separated subset of tabular,text,image")
+    enabled = tuple(x in names for x in ("tabular", "text", "image"))
+    if args.aux_loss_weight < 0:
+        parser.error("--aux-loss-weight must be >= 0")
+    if args.modality_dropout is not None and not 0 <= args.modality_dropout <= 1:
+        parser.error("--modality-dropout must be in [0,1]")
+    cfg = replace(ModelConfig(),
+                  epochs=args.epochs if args.epochs is not None else ModelConfig().epochs,
+                  batch_size=args.batch_size if args.batch_size is not None else ModelConfig().batch_size,
+                  seed=args.seed, auxiliary_loss_weight=args.aux_loss_weight,
+                  modality_dropout_prob=(args.modality_dropout if args.modality_dropout is not None
+                                         else ModelConfig().modality_dropout_prob))
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        gpu_name = torch.cuda.get_device_name(0)
-        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        print(f"-> [DEVICE] Khởi động trên GPU: [{gpu_name}] ({vram_gb:.1f} GB VRAM)")
+    print("Training device:", device)
+
+    if args.mode == "mock":
+        train, val, test, cards = create_mock_airbnb_data(cfg)
+        num_names, cat_names = cfg.num_feature_names, cfg.cat_cols
+        run_name = "mock"
+        artifact_dir = Path(args.data_dir) / "mock_artifacts"
     else:
-        print("-> [DEVICE] Không tìm thấy GPU CUDA, tự động fallback sang CPU.")
-
-    gold_dir = Path("data/gold_parquet")
-    if (gold_dir / "train.parquet").exists() and (gold_dir / "train_img_emb.npy").exists():
-        print("1. Phát hiện dữ liệu Gold từ PySpark! Đang nạp Parquet & NPY Embeddings...")
-        with open(gold_dir / "metadata.json", "r", encoding="utf-8") as f:
-            cat_cards = json.load(f)["cat_cardinalities"]
-
-        train_ds = AirbnbMultimodalDataset.from_spark_parquet(
-            parquet_path=str(gold_dir / "train.parquet"),
-            text_emb_npy_path=str(gold_dir / "train_text_emb.npy"),
-            image_emb_npy_path=str(gold_dir / "train_img_emb.npy"),
+        state = load_state(args.data_dir, required_status="finalized")
+        gold = state["run_path"] / "gold"
+        metadata = json.loads((gold / "metadata.json").read_text(encoding="utf-8"))
+        if metadata["run_id"] != state["run_id"]:
+            raise ValueError("Gold metadata and active run id do not match")
+        if metadata["raw_num_cols"] != cfg.num_cols or metadata["cat_col_names"] != cfg.cat_cols \
+                or metadata["num_feature_names"] != cfg.num_feature_names:
+            raise ValueError("Gold schema differs from ModelConfig. Rebuild ETL with matching config.")
+        cards = metadata["cat_cardinalities"]
+        num_names, cat_names = metadata["num_feature_names"], metadata["cat_col_names"]
+        train, val, test = [AirbnbMultimodalDataset.from_gold_parquet(str(gold / split), metadata)
+                            for split in ("train", "val", "test")]
+        run_name = state["run_id"]
+        artifact_dir = state["run_path"] / "artifacts"
+        keys = set(train.keys), set(val.keys), set(test.keys)
+        if keys[0] & keys[1] or keys[0] & keys[2] or keys[1] & keys[2]:
+            raise ValueError("Leakage: listing_key present in more than one data split")
+    train, val, test = [ds.select_modalities(enabled, args.cohort) for ds in (train, val, test)]
+    experiment_name = f"{args.cohort}__{'_'.join(x for x in ('tabular','text','image') if x in names)}__seed{cfg.seed}__aux{cfg.auxiliary_loss_weight:g}"
+    defaults = ModelConfig()
+    if (cfg.epochs != defaults.epochs
+            or cfg.batch_size != defaults.batch_size
+            or cfg.modality_dropout_prob != defaults.modality_dropout_prob):
+        experiment_name += (
+            f"__ep{cfg.epochs}__bs{cfg.batch_size}"
+            f"__md{cfg.modality_dropout_prob:g}"
         )
-        test_ds = AirbnbMultimodalDataset.from_spark_parquet(
-            parquet_path=str(gold_dir / "test.parquet"),
-            text_emb_npy_path=str(gold_dir / "test_text_emb.npy"),
-            image_emb_npy_path=str(gold_dir / "test_img_emb.npy"),
+    artifact_dir = artifact_dir / experiment_name
+    if artifact_dir.exists() and any(artifact_dir.iterdir()):
+        raise FileExistsError(
+            f"Experiment artifacts already exist: {artifact_dir}. "
+            "Existing checkpoints and results are protected from overwrite."
         )
-    else:
-        print("1. Chưa có dữ liệu Parquet, khởi tạo Mock Data để kiểm thử...")
-        train_ds, test_ds, cat_cards = create_mock_airbnb_data(cfg)
-
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
-
-    model = AirbnbMultimodalRegressor(cfg, cat_cards)
-    train_model(model, train_loader, cfg, device)
-
-    print("\n2. Đánh giá bằng MultimodalEvaluator trên tập Test...")
-    evaluator = MultimodalEvaluator(
-        model=model,
-        test_dataset=test_ds,
-        num_col_names=cfg.num_cols,
-        cat_col_names=cfg.cat_cols,
-        device=device,
-    )
-
-    base_rmse, gate_weights = evaluator.get_baseline_and_gate_weights()
-    print(f"\n-> Baseline Test RMSE: {base_rmse:.4f}")
-    print(f"-> Trọng số Cổng Gated Fusion trung bình: {gate_weights}")
-
-    print("\n--- KẾT QUẢ Ý 3: MỨC ĐỘ ẢNH HƯỞNG CỦA TỪNG NHÁNH (MODALITY PERMUTATION) ---")
-    df_modality = evaluator.measure_modality_importance()
-    print(df_modality.to_string(index=False))
-
-    print("\n--- KẾT QUẢ Ý 2: TOP 8 FIELD ẢNH HƯỞNG MẠNH NHẤT LÊN GIÁ (FIELD PERMUTATION) ---")
-    df_fields = evaluator.measure_field_importance()
-    print(df_fields.head(8).to_string(index=False))
+    print(f"Experiment: {experiment_name}; train/val/test: {len(train)}/{len(val)}/{len(test)}")
+    model = AirbnbMultimodalRegressor(cfg, cards)
+    train_loader = DataLoader(train, batch_size=cfg.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val, batch_size=cfg.batch_size, num_workers=0)
+    training = train_model(model, train_loader, val_loader, cfg, device,
+                           artifact_dir / "best_model.pt")
+    evaluator = MultimodalEvaluator(model, test, num_names, cat_names, device,
+                                    batch_size=cfg.batch_size, seed=cfg.seed)
+    metrics, weights, per_city = evaluator.evaluate(by_city=True)
+    print("TEST metrics:", metrics)
+    print("Mean gate weights (%):", weights, "(not causal contributions)")
+    print("Per-city metrics:\n", per_city.to_string(index=False))
+    ablations = evaluator.evaluate_ablation()
+    print("Ablation diagnostics (same trained model, no retraining):\n", ablations.to_string(index=False))
+    results = {"run_id": run_name, "mode": args.mode,
+               "modalities": [x for x in ('tabular', 'text', 'image') if x in names],
+               "cohort": args.cohort, "seed": cfg.seed,
+               "sample_counts": {"train": len(train), "val": len(val), "test": len(test)},
+               "auxiliary_loss_weight": cfg.auxiliary_loss_weight,
+               "modality_dropout_prob": cfg.modality_dropout_prob,
+               "test_metrics": metrics,
+               "mean_gate_weights_percent": weights,
+               "per_city": per_city.to_dict(orient="records"),
+               "ablation_diagnostic": ablations.to_dict(orient="records"),
+               "training": training}
+    if not args.skip_ridge_baseline:
+        results["ridge_tabular_baseline"] = ridge_tabular_baseline(train, test)
+        print("Separately trained Ridge tabular-only baseline:", results["ridge_tabular_baseline"])
+    if not args.skip_importance:
+        mod = evaluator.measure_modality_importance(n_repeats=3)
+        fields = evaluator.measure_field_importance(n_repeats=3)
+        print("Modality permutation:\n", mod.to_string(index=False))
+        print("Top fields by permutation:\n", fields.head(12).to_string(index=False))
+        results["modality_permutation"] = mod.to_dict(orient="records")
+        results["field_permutation"] = fields.to_dict(orient="records")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "results.json").write_text(json.dumps(results, ensure_ascii=False,
+        indent=2, allow_nan=False), encoding="utf-8")
+    evaluator.prediction_frame().to_csv(artifact_dir / "test_predictions.csv", index=False)
+    print("Saved:", artifact_dir / "results.json")
 
 
 if __name__ == "__main__":

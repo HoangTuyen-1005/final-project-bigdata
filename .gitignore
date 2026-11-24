@@ -1,7 +1,14 @@
 venv/
-
 __pycache__/
-
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
 dataset/
 data/
 hadoop/
+*.log
+document/
+report/
+
+check/
+

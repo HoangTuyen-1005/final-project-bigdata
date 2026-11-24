@@ -60,7 +60,7 @@ class FTTransformerEncoder(nn.Module):
         super().__init__()
         self.tokenizer = FeatureTokenizer(num_continuous, cat_cardinalities, d_model)
 
-        # Token [CLS] học thông tin tổng hợp của toàn bộ 18 cột Tabular
+        # Token [CLS] học thông tin tổng hợp các cột Tabular (kể cả missing indicators)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.normal_(self.cls_token, std=0.02)
 

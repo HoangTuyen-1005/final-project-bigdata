@@ -1,33 +1,39 @@
+"""Local Spark defaults may be overridden by spark-submit/Databricks."""
 import os
 import sys
 from pathlib import Path
-
+from pyspark import SparkConf
 from pyspark.sql import SparkSession
 
 
 def create_spark_session(app_name: str = "Airbnb_Multimodal_BigData_ETL") -> SparkSession:
-    """Khởi tạo SparkSession với cấu hình tối ưu cho ETL và MLlib."""
-    # 1. Khóa cứng trình thông dịch Python cho driver và worker executors
-    os.environ["PYSPARK_PYTHON"] = sys.executable
-    os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
-
-    # 2. Tự động nhận diện HADOOP_HOME cho Windows để chạy winutils.exe
-    project_root = Path(__file__).resolve().parent.parent
-    hadoop_home = project_root / "hadoop"
-    if (hadoop_home / "bin" / "winutils.exe").exists():
-        os.environ["HADOOP_HOME"] = str(hadoop_home)
-        os.environ["PATH"] = str(hadoop_home / "bin") + os.pathsep + os.environ.get("PATH", "")
-    spark = (
-        SparkSession.builder.appName(app_name)
-        .master("local[*]")  # Khi chạy cluster (YARN/K8s) thì đổi hoặc truyền qua spark-submit
-        .config("spark.driver.memory", "4g")
-        .config("spark.executor.memory", "4g")
-        # Bật Adaptive Query Execution (AQE) của Spark 3.x để tối ưu hóa vật lý tự động
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        # Bật Apache Arrow để tăng tốc độ chuyển từ Spark DataFrame sang NumPy/PyTorch
-        .config("spark.sql.execution.arrow.pyspark.enabled", "true")
-        .getOrCreate()
-    )
+    # Do not override configured cluster Python executors or master.
+    if not os.environ.get("SPARK_MASTER"):
+        os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+        os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+    hadoop_home = Path(__file__).resolve().parent.parent / "hadoop"
+    if os.name == "nt" and (hadoop_home / "bin" / "winutils.exe").exists():
+        os.environ.setdefault("HADOOP_HOME", str(hadoop_home))
+        bin_dir = str(hadoop_home / "bin")
+        if bin_dir not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+    builder = SparkSession.builder.appName(app_name)
+    active_master = SparkConf(loadDefaults=True).get("spark.master", None)
+    if os.environ.get("SPARK_MASTER"):
+        builder = builder.master(os.environ["SPARK_MASTER"])
+    elif not os.environ.get("DATABRICKS_RUNTIME_VERSION") and not active_master:
+        builder = builder.master("local[2]").config("spark.driver.memory", "4g")
+    # Local machines should not launch 200 tiny shuffle partitions by default.
+    # Respect cluster/spark-submit settings and explicit overrides.
+    local_default = not os.environ.get("SPARK_MASTER") and not active_master
+    shuffle = os.environ.get("SPARK_SQL_SHUFFLE_PARTITIONS")
+    if shuffle:
+        builder = builder.config("spark.sql.shuffle.partitions", shuffle)
+    elif local_default:
+        builder = builder.config("spark.sql.shuffle.partitions", "8")
+    builder = (builder.config("spark.sql.adaptive.enabled", "true")
+               .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+               .config("spark.sql.adaptive.skewJoin.enabled", "true"))
+    spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
     return spark
