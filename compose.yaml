@@ -1,0 +1,236 @@
+name: airbnb-local
+
+x-runtime: &runtime
+  user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+  init: true
+
+x-s3-env: &s3-env
+  STORAGE_BACKEND: s3
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  S3_BUCKET: ${S3_BUCKET:-airbnb-lakehouse}
+
+x-worker: &worker
+  <<: *runtime
+  image: airbnb-spark:local
+  pull_policy: never
+  depends_on:
+    spark-master:
+      condition: service_healthy
+  environment:
+    <<: *s3-env
+    SPARK_DAEMON_MEMORY: 256m
+
+services:
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+
+  minio-init:
+    image: airbnb-spark:local
+    pull_policy: never
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-airbnb-lakehouse}
+    entrypoint:
+      - python
+      - -c
+      - |
+        import os, time, urllib.request, boto3
+        from botocore.config import Config
+        from botocore.exceptions import ClientError
+        endpoint = os.environ["S3_ENDPOINT"]
+        bucket = os.environ["S3_BUCKET"]
+        for _ in range(30):
+            try:
+                urllib.request.urlopen(f"{endpoint}/minio/health/live", timeout=2).close()
+                break
+            except Exception:
+                time.sleep(1)
+        else:
+            raise SystemExit("MinIO did not become ready in time")
+        s3 = boto3.client("s3", endpoint_url=endpoint,
+                          aws_access_key_id=os.environ["S3_ACCESS_KEY"],
+                          aws_secret_access_key=os.environ["S3_SECRET_KEY"],
+                          config=Config(s3={"addressing_style": "path"}))
+        try:
+            s3.head_bucket(Bucket=bucket)
+        except ClientError:
+            s3.create_bucket(Bucket=bucket)
+        print(f"[MinIO] Bucket ready: {bucket}")
+
+  spark-master:
+    <<: *runtime
+    image: airbnb-spark:local
+    pull_policy: never
+    command:
+      - spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      - "127.0.0.1:${SPARK_UI_PORT:-8080}:8080"
+    environment:
+      <<: *s3-env
+      SPARK_DAEMON_MEMORY: 256m
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://spark-master:8080/json/', timeout=2).close()"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  spark-worker-1:
+    <<: *worker
+    command:
+      - spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --host
+      - spark-worker-1
+      - --cores
+      - "1"
+      - --memory
+      - 1024m
+      - --work-dir
+      - /tmp/spark-work
+      - spark://spark-master:7077
+
+  spark-worker-2:
+    <<: *worker
+    command:
+      - spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --host
+      - spark-worker-2
+      - --cores
+      - "1"
+      - --memory
+      - 1024m
+      - --work-dir
+      - /tmp/spark-work
+      - spark://spark-master:7077
+
+  data-service:
+    <<: *runtime
+    image: airbnb-spark:local
+    build:
+      context: .
+      dockerfile: services/data_service/Dockerfile
+      args:
+        LOCAL_UID: "${LOCAL_UID:-1000}"
+        LOCAL_GID: "${LOCAL_GID:-1000}"
+    entrypoint: ["python", "-m", "services.data_service.entrypoint"]
+    command: ["serve"]
+    ports:
+      - "127.0.0.1:${DATA_SERVICE_PORT:-8001}:8001"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+      spark-worker-1:
+        condition: service_started
+      spark-worker-2:
+        condition: service_started
+    environment:
+      <<: *s3-env
+      SPARK_MASTER: spark://spark-master:7077
+      SPARK_MASTER_UI: http://spark-master:8080/json/
+      SPARK_EXPECTED_WORKERS: "2"
+      SPARK_SQL_SHUFFLE_PARTITIONS: "4"
+      PYSPARK_SUBMIT_ARGS: >-
+        --deploy-mode client --driver-memory 1g
+        --executor-memory 768m --executor-cores 1 --total-executor-cores 2
+        --conf spark.driver.bindAddress=0.0.0.0
+        --conf spark.scheduler.minRegisteredResourcesRatio=1.0
+        pyspark-shell
+    volumes:
+      - ./data/raw:/data/raw:ro
+
+  model-service:
+    <<: *runtime
+    image: airbnb-model:local
+    build:
+      context: .
+      dockerfile: services/model_service/Dockerfile
+    entrypoint: ["python", "-m", "services.model_service.entrypoint"]
+    command: ["serve"]
+    ports:
+      - "127.0.0.1:${MODEL_SERVICE_PORT:-8002}:8002"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *s3-env
+      HF_HOME: /data/cache/huggingface
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+    volumes:
+      - hf_cache:/data/cache/huggingface
+      - image_cache:/tmp/image_cache
+
+  inference-service:
+    <<: *runtime
+    image: airbnb-inference:local
+    build:
+      context: .
+      dockerfile: services/inference_service/Dockerfile
+    entrypoint: ["python", "-m", "uvicorn", "services.inference_service.api:app", "--host", "0.0.0.0", "--port", "8003"]
+    ports:
+      - "127.0.0.1:${INFERENCE_SERVICE_PORT:-8003}:8003"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *s3-env
+      INFERENCE_DATA_DIR: /data/demo
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8003/health', timeout=2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  orchestrator-service:
+    <<: *runtime
+    image: airbnb-orchestrator:local
+    build:
+      context: .
+      dockerfile: services/orchestrator_service/Dockerfile
+    entrypoint: ["python", "-m", "uvicorn", "services.orchestrator_service.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:${ORCHESTRATOR_PORT:-8000}:8000"
+    depends_on:
+      data-service:
+        condition: service_started
+      model-service:
+        condition: service_started
+      inference-service:
+        condition: service_healthy
+    environment:
+      DATA_SERVICE_URL: http://data-service:8001
+      MODEL_SERVICE_URL: http://model-service:8002
+      INFERENCE_SERVICE_URL: http://inference-service:8003
+
+volumes:
+  minio_data:
+  hf_cache:
+  image_cache:

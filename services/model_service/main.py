@@ -1,0 +1,262 @@
+"""Train and evaluate FT-Transformer + E5 + CLIP gated multimodal model.
+
+Default mode is real data ONLY; synthetic smoke data requires --mode mock.
+"""
+from __future__ import annotations
+
+import argparse
+from dataclasses import replace
+import json
+import random
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from config import MODALITY_NAMES, ModelConfig
+from contracts.state import experiment_dir_name, load_state
+from contracts.storage import has_any_objects, is_s3_uri, join_uri, read_text, upload_file, write_text
+from dataset import AirbnbMultimodalDataset
+from evaluator import MultimodalEvaluator
+from models.multimodal_net import AirbnbMultimodalRegressor
+
+
+def create_mock_airbnb_data(cfg: ModelConfig, n_samples: int = 600):
+    rng = np.random.default_rng(cfg.seed)
+    n_num = len(cfg.num_feature_names)
+    x_num = rng.normal(size=(n_samples, n_num)).astype(np.float32)
+    cards = [5, 25, 10, 4, 3, 3]
+    x_cat = np.stack([rng.integers(0, card, size=n_samples) for card in cards], axis=1)
+    x_txt = rng.normal(size=(n_samples, cfg.raw_text_dim)).astype(np.float32)
+    x_img = rng.normal(size=(n_samples, cfg.raw_image_dim)).astype(np.float32)
+    y = (4.5 + .45*x_num[:, 2] + .35*x_num[:, 3] + .25*(x_cat[:, 3] == 0)
+         + .2*x_txt[:, 0] + .15*x_img[:, 0] + rng.normal(0, .1, n_samples)).astype(np.float32)
+    perm = rng.permutation(n_samples)
+    def subset(idx):
+        return AirbnbMultimodalDataset(x_num[idx], x_cat[idx], x_txt[idx], x_img[idx], y[idx])
+    return subset(perm[:int(.8*n_samples)]), subset(perm[int(.8*n_samples):int(.9*n_samples)]), \
+        subset(perm[int(.9*n_samples):]), cards
+
+
+def run_validation(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    loss_total, count = 0., 0
+    criterion = nn.HuberLoss(reduction="sum")
+    with torch.no_grad():
+        for batch in loader:
+            inputs = [batch[k].to(device) for k in ("x_num", "x_cat", "x_txt", "x_img")]
+            pred, _ = model(*inputs, available_mask=batch["available_mask"].to(device))
+            y = batch["y"].to(device)
+            loss_total += criterion(pred, y).item()
+            count += len(y)
+    return loss_total / count
+
+
+def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
+                cfg: ModelConfig, device: torch.device, checkpoint: Path) -> dict:
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    criterion = nn.HuberLoss()
+    model.to(device)
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    best_loss = float("inf")
+    best_epoch = 0
+    stale = 0
+    history = []
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+        train_sum = 0.0
+        for batch in train_loader:
+            optimizer.zero_grad(set_to_none=True)
+            inputs = [batch[k].to(device) for k in ("x_num", "x_cat", "x_txt", "x_img")]
+            availability = batch["available_mask"].to(device)
+            if cfg.auxiliary_loss_weight > 0:
+                prediction, _, branches = model(*inputs, available_mask=availability,
+                                                 return_aux=True)
+            else:
+                prediction, _ = model(*inputs, available_mask=availability)
+            target = batch["y"].to(device)
+            loss = criterion(prediction, target)
+            if cfg.auxiliary_loss_weight > 0:
+                # Only supervise genuinely present, enabled branches. Never train on
+                # the all-zero placeholder for a missing embedding.
+                per_branch = torch.nn.functional.huber_loss(
+                    branches, target.unsqueeze(1).expand_as(branches), reduction="none")
+                aux_loss = (per_branch * availability).sum() / availability.sum().clamp_min(1)
+                loss = loss + cfg.auxiliary_loss_weight * aux_loss
+            loss.backward()
+            optimizer.step()
+            train_sum += loss.item() * len(batch["y"])
+        train_loss = train_sum / len(train_loader.dataset)
+        val_loss = run_validation(model, val_loader, device)
+        history.append({"epoch": epoch, "train_huber": train_loss, "val_huber": val_loss})
+        print(f"Epoch {epoch:02d} | train={train_loss:.5f} | val={val_loss:.5f}", flush=True)
+        if val_loss < best_loss - 1e-6:
+            best_loss, best_epoch, stale = val_loss, epoch, 0
+            torch.save(model.state_dict(), checkpoint)
+        else:
+            stale += 1
+            if stale >= cfg.early_stopping_patience:
+                print("Early stopping at epoch", epoch)
+                break
+    model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
+    print(f"Restored best checkpoint from epoch {best_epoch} (val Huber={best_loss:.5f})")
+    return {"best_epoch": best_epoch, "best_val_huber": best_loss, "history": history}
+
+
+def ridge_tabular_baseline(train: AirbnbMultimodalDataset,
+                           test: AirbnbMultimodalDataset) -> dict:
+    """A separately fitted tabular-only baseline; one-hot avoids ordinal category misuse."""
+    from scipy.sparse import csr_matrix, hstack
+    from sklearn.linear_model import Ridge
+    from sklearn.preprocessing import OneHotEncoder
+    enc = OneHotEncoder(handle_unknown="ignore")
+    cat_train = enc.fit_transform(train.x_cat.numpy())
+    cat_test = enc.transform(test.x_cat.numpy())
+    train_x = hstack([csr_matrix(train.x_num.numpy()), cat_train], format="csr")
+    test_x = hstack([csr_matrix(test.x_num.numpy()), cat_test], format="csr")
+    estimator = Ridge(alpha=10.0, solver="lsqr")
+    estimator.fit(train_x, train.y.numpy())
+    p = estimator.predict(test_x)
+    target = test.y.numpy()
+    return {"RMSE_log": float(np.sqrt(np.mean((p-target)**2))),
+            "MAE_log": float(np.mean(np.abs(p-target)))}
+
+
+def main() -> None:
+    defaults = ModelConfig()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=["real", "mock"], default="real")
+    parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--run-id", help="Use this finalized run in real mode.")
+    parser.add_argument("--epochs", type=int, default=defaults.epochs)
+    parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
+    parser.add_argument("--skip-importance", action="store_true")
+    parser.add_argument("--modalities", default="tabular,text,image",
+                        help="Comma-separated nonempty subset: tabular,text,image")
+    parser.add_argument("--cohort", choices=["complete", "eligible"], default="complete",
+                        help="complete = same 3-modality rows for fair comparison")
+    parser.add_argument("--aux-loss-weight", type=float, default=defaults.auxiliary_loss_weight,
+                        help="Independent per-branch Huber auxiliary weight (default %(default)g)")
+    parser.add_argument("--modality-dropout", type=float, default=defaults.modality_dropout_prob,
+                        help="Symmetric modality dropout probability (default %(default)g)")
+    parser.add_argument("--seed", type=int, default=defaults.seed)
+    parser.add_argument("--skip-ridge-baseline", action="store_true")
+    args = parser.parse_args()
+    if args.run_id is not None and args.mode == "mock":
+        parser.error("--run-id is only valid when reading the Gold pipeline")
+    if args.epochs < 1:
+        parser.error("--epochs must be >= 1")
+    if args.batch_size < 1:
+        parser.error("--batch-size must be >= 1")
+    names = [x.strip().lower() for x in args.modalities.split(",")]
+    if len(set(names)) != len(names) or any(name not in MODALITY_NAMES for name in names):
+        parser.error("--modalities must be a unique comma-separated subset of tabular,text,image")
+    enabled = tuple(name in names for name in MODALITY_NAMES)
+    selected_modalities = [name for name in MODALITY_NAMES if name in names]
+    if args.aux_loss_weight < 0:
+        parser.error("--aux-loss-weight must be >= 0")
+    if not 0 <= args.modality_dropout <= 1:
+        parser.error("--modality-dropout must be in [0,1]")
+    cfg = replace(defaults, epochs=args.epochs, batch_size=args.batch_size,
+                  seed=args.seed, auxiliary_loss_weight=args.aux_loss_weight,
+                  modality_dropout_prob=args.modality_dropout)
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Training device:", device)
+
+    if args.mode == "mock":
+        train, val, test, cards = create_mock_airbnb_data(cfg)
+        num_names, cat_names = cfg.num_feature_names, cfg.cat_cols
+        run_name = "mock"
+        price_currency = None
+        embedding_config = None
+        artifact_dir = Path(args.data_dir) / "mock_artifacts"
+    else:
+        state = load_state(args.data_dir, required_status="finalized", run_id=args.run_id)
+        gold = join_uri(state["run_path"], "gold")
+        metadata = json.loads(read_text(join_uri(gold, "metadata.json"), encoding="utf-8"))
+        if metadata["run_id"] != state["run_id"]:
+            raise ValueError("Gold metadata and active run id do not match")
+        if metadata["raw_num_cols"] != cfg.num_cols or metadata["cat_col_names"] != cfg.cat_cols \
+                or metadata["num_feature_names"] != cfg.num_feature_names:
+            raise ValueError("Gold schema differs from ModelConfig. Rebuild ETL with matching config.")
+        cards = metadata["cat_cardinalities"]
+        num_names, cat_names = metadata["num_feature_names"], metadata["cat_col_names"]
+        train, val, test = [AirbnbMultimodalDataset.from_gold_parquet(join_uri(gold, split), metadata)
+                            for split in ("train", "val", "test")]
+        run_name = state["run_id"]
+        price_currency = metadata.get("price_currency")
+        embedding_config = metadata.get("embedding_config")
+        artifact_dir = join_uri(state["run_path"], "artifacts")
+        keys = set(train.keys), set(val.keys), set(test.keys)
+        if keys[0] & keys[1] or keys[0] & keys[2] or keys[1] & keys[2]:
+            raise ValueError("Leakage: listing_key present in more than one data split")
+    train, val, test = [ds.select_modalities(enabled, args.cohort) for ds in (train, val, test)]
+    experiment_name = experiment_dir_name(cfg, args.cohort, selected_modalities)
+    artifact_dir = join_uri(artifact_dir, experiment_name)
+    if has_any_objects(artifact_dir):
+        raise FileExistsError(
+            f"Experiment artifacts already exist: {artifact_dir}. "
+            "Existing checkpoints and results are protected from overwrite."
+        )
+    print(f"Experiment: {experiment_name}; train/val/test: {len(train)}/{len(val)}/{len(test)}")
+    model = AirbnbMultimodalRegressor(cfg, cards)
+    train_loader = DataLoader(train, batch_size=cfg.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val, batch_size=cfg.batch_size, num_workers=0)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        local_ckpt = (Path(tmp_dir) / "best_model.pt") if is_s3_uri(artifact_dir) else (Path(artifact_dir) / "best_model.pt")
+        training = train_model(model, train_loader, val_loader, cfg, device, local_ckpt)
+        evaluator = MultimodalEvaluator(model, test, num_names, cat_names, device,
+                                        batch_size=cfg.batch_size, seed=cfg.seed)
+        metrics, weights, per_city = evaluator.evaluate(by_city=True)
+        print("TEST metrics:", metrics)
+        print("Mean gate weights (%):", weights, "(not causal contributions)")
+        print("Per-city metrics:\n", per_city.to_string(index=False))
+        ablations = evaluator.evaluate_ablation()
+        print("Ablation diagnostics (same trained model, no retraining):\n", ablations.to_string(index=False))
+        results = {"run_id": run_name, "mode": args.mode,
+                   "price_currency": price_currency,
+                   "embedding_config": embedding_config,
+                   "modalities": selected_modalities,
+                   "cohort": args.cohort, "seed": cfg.seed,
+                   "sample_counts": {"train": len(train), "val": len(val), "test": len(test)},
+                   "auxiliary_loss_weight": cfg.auxiliary_loss_weight,
+                   "modality_dropout_prob": cfg.modality_dropout_prob,
+                   "test_metrics": metrics,
+                   "mean_gate_weights_percent": weights,
+                   "per_city": per_city.to_dict(orient="records"),
+                   "ablation_diagnostic": ablations.to_dict(orient="records"),
+                   "training": training}
+        if not args.skip_ridge_baseline:
+            results["ridge_tabular_baseline"] = ridge_tabular_baseline(train, test)
+            print("Separately trained Ridge tabular-only baseline:", results["ridge_tabular_baseline"])
+        if not args.skip_importance:
+            mod = evaluator.measure_modality_importance(n_repeats=3)
+            fields = evaluator.measure_field_importance(n_repeats=3)
+            print("Modality permutation:\n", mod.to_string(index=False))
+            print("Top fields by permutation:\n", fields.head(12).to_string(index=False))
+            results["modality_permutation"] = mod.to_dict(orient="records")
+            results["field_permutation"] = fields.to_dict(orient="records")
+        results_uri = join_uri(artifact_dir, "results.json")
+        preds_uri = join_uri(artifact_dir, "test_predictions.csv")
+        if is_s3_uri(artifact_dir):
+            upload_file(local_ckpt, join_uri(artifact_dir, "best_model.pt"))
+            local_preds = Path(tmp_dir) / "test_predictions.csv"
+            evaluator.prediction_frame().to_csv(local_preds, index=False)
+            upload_file(local_preds, preds_uri)
+        else:
+            Path(artifact_dir).mkdir(parents=True, exist_ok=True)
+            evaluator.prediction_frame().to_csv(preds_uri, index=False)
+        write_text(results_uri, json.dumps(results, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+        print("Saved:", results_uri)
+
+
+if __name__ == "__main__":
+    main()

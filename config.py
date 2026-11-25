@@ -2,6 +2,15 @@
 from dataclasses import dataclass, field
 
 
+MODALITY_NAMES = ("tabular", "text", "image")
+PRICE_CURRENCY = "USD"
+
+
+def numeric_feature_names(columns: list[str]) -> list[str]:
+    """Match Gold vector order: scaled values followed by missing indicators."""
+    return [*columns, *[f"{column}__missing" for column in columns]]
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     d_model: int = 128
@@ -37,5 +46,4 @@ class ModelConfig:
 
     @property
     def num_feature_names(self) -> list[str]:
-        # Missing indicators are appended AFTER scaled numeric values.
-        return [*self.num_cols, *[f"{x}__missing" for x in self.num_cols]]
+        return numeric_feature_names(self.num_cols)

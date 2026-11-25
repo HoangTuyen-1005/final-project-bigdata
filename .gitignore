@@ -1,14 +1,19 @@
+.venv/
 venv/
 __pycache__/
 *.py[cod]
+*.bak
 .pytest_cache/
+.ruff_cache/
 .ipynb_checkpoints/
 dataset/
-data/
+/data/*
+!/data/raw/
+/data/raw/*
+!/data/raw/README.md
 hadoop/
 *.log
 document/
 report/
-
 check/
 

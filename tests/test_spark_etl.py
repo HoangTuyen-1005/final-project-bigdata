@@ -1,13 +1,11 @@
 """Requires pyspark + Java; runs locally on a development machine."""
 import pytest
 
-pyspark = pytest.importorskip("pyspark")
-from pyspark.sql import SparkSession
+pytest.importorskip("pyspark")
 from pyspark.sql import functions as F
+
 from spark_etl.cleaner import AirbnbSparkCleaner
 from spark_etl.feature_pipeline import SparkTabularFeaturizer
-
-
 from spark_etl.spark_session import create_spark_session
 
 
@@ -16,7 +14,6 @@ def spark():
     session = create_spark_session(app_name="test_airbnb_etl")
     yield session
     session.stop()
-
 
 
 def test_cleaner_preserves_missing_numeric_and_parses_json(spark):

@@ -1,0 +1,15 @@
+.git
+.venv
+venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+data
+dataset
+document
+report
+check
+hadoop
+*.zip
+*.bak
+*.log
