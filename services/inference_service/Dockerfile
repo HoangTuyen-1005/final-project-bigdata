@@ -6,13 +6,13 @@ ENV PYTHONPATH=/app \
     HOME=/tmp
 WORKDIR /app
 
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126
 COPY services/inference_service/requirements.txt /tmp/requirements.txt
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir --index-url "$TORCH_INDEX_URL" torch==2.7.1 \
-    && pip install --no-cache-dir -r /tmp/requirements.txt
+    && pip install --no-cache-dir --default-timeout=120 --retries 5 --index-url "$TORCH_INDEX_URL" torch==2.7.1 \
+    && pip install --no-cache-dir --default-timeout=120 --retries 5 -r /tmp/requirements.txt
 
 COPY config.py project_state.py ./
 COPY contracts/ ./contracts/

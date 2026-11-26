@@ -135,6 +135,29 @@ def list_s3_keys(prefix_uri: str, cfg: StorageConfig | None = None) -> list[str]
     return sorted(keys)
 
 
+def list_json_uris(prefix_uri: str | Path, cfg: StorageConfig | None = None) -> list[str]:
+    if is_s3_uri(prefix_uri):
+        return [u for u in list_s3_keys(str(prefix_uri).rstrip("/") + "/", cfg) if u.endswith(".json")]
+    root = Path(prefix_uri)
+    if not root.is_dir():
+        return []
+    return sorted(str(p) for p in root.glob("*.json") if p.is_file())
+
+
+def parquet_size_bytes(uri: str | Path, cfg: StorageConfig | None = None) -> int:
+    if is_s3_uri(uri):
+        bucket, prefix = parse_s3_uri(str(uri))
+        client = _s3_client(cfg)
+        paginator = client.get_paginator("list_objects_v2")
+        total = 0
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix.rstrip("/") + "/"):
+            for item in page.get("Contents", []):
+                if item["Key"].endswith(".parquet"):
+                    total += int(item["Size"])
+        return total
+    return sum(p.stat().st_size for p in Path(uri).rglob("*.parquet") if p.is_file())
+
+
 def has_any_objects(uri: str | Path, cfg: StorageConfig | None = None) -> bool:
     if is_s3_uri(uri):
         bucket, prefix = parse_s3_uri(str(uri))

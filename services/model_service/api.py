@@ -1,14 +1,91 @@
 """FastAPI HTTP interface for the PyTorch Model Service."""
 from __future__ import annotations
 
+import threading
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from config import ModelConfig
 from contracts.jobs import JobManager
 from contracts.storage import StorageConfig
 
 app = FastAPI(title="Airbnb BigData - Model Service", version="1.0.0")
 jobs = JobManager("model-service", max_workers=1)
+
+
+class _EncoderCache:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._text_name: str | None = None
+        self._text_encoder = None
+        self._image_name: str | None = None
+        self._image_encoder = None
+        self._downloader = None
+
+    def encode(self, text: str | None, image_url: str | None, text_model: str, image_model: str) -> dict:
+        import numpy as np
+        import torch
+        from sentence_transformers import SentenceTransformer
+        from extract_embedding import SafeImageDownloader
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        cfg = ModelConfig()
+        text_vec = None
+        image_vec = None
+        image_status = "skipped"
+
+        with self._lock:
+            if isinstance(text, str) and text.strip():
+                if self._text_encoder is None or self._text_name != text_model:
+                    self._text_encoder = SentenceTransformer(text_model, device=device)
+                    self._text_name = text_model
+                emb = self._text_encoder.encode(
+                    ["passage: " + text.strip()],
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                )
+                vec = np.asarray(emb[0], dtype=np.float32)
+                if len(vec) != cfg.raw_text_dim:
+                    raise ValueError(f"Text dim mismatch: {len(vec)} != {cfg.raw_text_dim}")
+                text_vec = vec.tolist()
+
+            if isinstance(image_url, str) and image_url.strip():
+                if self._downloader is None:
+                    self._downloader = SafeImageDownloader(cache_dir="/tmp/image_cache")
+                img = self._downloader.download(image_url.strip())
+                if img is None:
+                    image_status = "unavailable"
+                else:
+                    try:
+                        if self._image_encoder is None or self._image_name != image_model:
+                            self._image_encoder = SentenceTransformer(image_model, device=device)
+                            self._image_name = image_model
+                        emb = self._image_encoder.encode(
+                            [img],
+                            show_progress_bar=False,
+                            convert_to_numpy=True,
+                            normalize_embeddings=True,
+                        )
+                        vec = np.asarray(emb[0], dtype=np.float32)
+                        norm = float(np.linalg.norm(vec))
+                        if len(vec) != cfg.raw_image_dim or not np.isfinite(norm) or norm <= 1e-12:
+                            image_status = "invalid_embedding"
+                        else:
+                            image_vec = (vec / norm).tolist()
+                            image_status = "ok"
+                    finally:
+                        img.close()
+
+        return {
+            "device": device,
+            "text_embedding": text_vec,
+            "image_embedding": image_vec,
+            "image_status": image_status,
+        }
+
+
+_encoders = _EncoderCache()
 
 
 class DemoInputRequest(BaseModel):
@@ -55,6 +132,13 @@ class DiagnoseRequest(BaseModel):
     run_id: str | None = None
     limit: int = Field(default=5000, ge=1)
     out: str | None = None
+
+
+class EncodeRequest(BaseModel):
+    text: str | None = None
+    image_url: str | None = None
+    text_model: str = "intfloat/multilingual-e5-base"
+    image_model: str = "clip-ViT-B-32"
 
 
 @app.get("/health")
@@ -147,3 +231,11 @@ def submit_diagnose(req: DiagnoseRequest) -> dict:
     if req.out:
         args.extend(["--out", req.out])
     return jobs.submit("diagnose", "services.model_service.entrypoint", args)
+
+
+@app.post("/encode")
+def encode_inputs(req: EncodeRequest) -> dict:
+    try:
+        return _encoders.encode(req.text, req.image_url, req.text_model, req.image_model)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

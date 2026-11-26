@@ -185,6 +185,13 @@ services:
     volumes:
       - hf_cache:/data/cache/huggingface
       - image_cache:/tmp/image_cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   inference-service:
     <<: *runtime
@@ -208,6 +215,13 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   orchestrator-service:
     <<: *runtime
@@ -219,6 +233,8 @@ services:
     ports:
       - "127.0.0.1:${ORCHESTRATOR_PORT:-8000}:8000"
     depends_on:
+      minio-init:
+        condition: service_completed_successfully
       data-service:
         condition: service_started
       model-service:
@@ -226,6 +242,7 @@ services:
       inference-service:
         condition: service_healthy
     environment:
+      <<: *s3-env
       DATA_SERVICE_URL: http://data-service:8001
       MODEL_SERVICE_URL: http://model-service:8002
       INFERENCE_SERVICE_URL: http://inference-service:8003

@@ -6,7 +6,11 @@ all joins, validation, imputation, feature scaling and persisted Parquet layers.
 from __future__ import annotations
 
 import argparse
+import csv
+import gzip
 import json
+import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -21,6 +25,47 @@ from contracts.storage import StorageConfig, is_s3_uri, join_uri, list_s3_keys, 
 from spark_etl.cleaner import AirbnbSparkCleaner
 from spark_etl.feature_pipeline import SparkTabularFeaturizer
 from spark_etl.spark_session import create_spark_session
+
+
+SHARD_THRESHOLD_BYTES = 16 * 1024 * 1024  # 16 MiB
+SHARD_ROWS_PER_PART = 10_000
+
+
+def _shard_csv_to_s3(local_file: Path, parts_prefix: str, rows_per_part: int = SHARD_ROWS_PER_PART) -> None:
+    """Split a large multiline CSV into gzipped CSV parts on S3 for parallel Spark reads."""
+    csv.field_size_limit(min(sys.maxsize, 10 * 1024 * 1024))
+    opener = gzip.open if local_file.suffix == ".gz" else open
+    part_idx = 0
+
+    def _upload_part(header: list[str], rows: list[list[str]], idx: int) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".csv.gz", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            with gzip.open(tmp_path, "wt", encoding="utf-8", newline="") as gz_out:
+                writer = csv.writer(gz_out)
+                writer.writerow(header)
+                writer.writerows(rows)
+            upload_file(tmp_path, join_uri(parts_prefix, f"part-{idx:04d}.csv.gz"))
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    with opener(local_file, "rt", encoding="utf-8-sig", newline="") as stream:
+        reader = csv.reader(stream)
+        header = next(reader, None)
+        if not header:
+            return
+        batch: list[list[str]] = []
+        for row in reader:
+            batch.append(row)
+            if len(batch) >= rows_per_part:
+                _upload_part(header, batch, part_idx)
+                part_idx += 1
+                batch = []
+        if batch or part_idx == 0:
+            _upload_part(header, batch, part_idx)
+            part_idx += 1
+    write_text(join_uri(parts_prefix, "_SUCCESS"), "", encoding="utf-8")
+    print(f"[Shard] {local_file.name} -> {part_idx} gzipped parts at {parts_prefix}", flush=True)
 
 
 def resolve_sources(
@@ -53,15 +98,31 @@ def resolve_sources(
                 for local_file in local_candidates:
                     if not local_file.is_file():
                         continue
-                    target_uri = join_uri(raw_prefix, local_file.parent.name, local_file.name)
-                    if not uri_exists(target_uri):
-                        print(f"[Sync] Uploading {local_file} -> {target_uri}", flush=True)
-                        upload_file(local_file, target_uri)
+                    city = local_file.parent.name
+                    if local_file.stat().st_size >= SHARD_THRESHOLD_BYTES:
+                        parts_prefix = join_uri(raw_prefix, city, "parts")
+                        if not uri_exists(join_uri(parts_prefix, "_SUCCESS")):
+                            _shard_csv_to_s3(local_file, parts_prefix)
+                    else:
+                        target_uri = join_uri(raw_prefix, city, local_file.name)
+                        if not uri_exists(target_uri):
+                            print(f"[Sync] Uploading {local_file} -> {target_uri}", flush=True)
+                            upload_file(local_file, target_uri)
+            city_sources: dict[str, list[str]] = {}
+            sharded_cities: set[str] = set()
             for uri in list_s3_keys(raw_prefix):
                 rel = uri.removeprefix(raw_prefix + "/")
                 parts = rel.split("/")
-                if len(parts) == 2 and parts[1] in ("listings.csv", "listings.csv.gz"):
-                    result.append((parts[0], uri))
+                if len(parts) == 3 and parts[1] == "parts" and parts[2] == "_SUCCESS":
+                    sharded_cities.add(parts[0])
+                elif len(parts) == 2 and parts[1] in ("listings.csv", "listings.csv.gz"):
+                    city_sources.setdefault(parts[0], []).append(uri)
+            for city in sorted(sharded_cities | set(city_sources)):
+                if city in sharded_cities:
+                    result.append((city, join_uri(raw_prefix, city, "parts")))
+                else:
+                    for uri in city_sources.get(city, []):
+                        result.append((city, uri))
         else:
             raw_dir = Path(root) / "raw"
             candidates = sorted((*raw_dir.glob("*/listings.csv"), *raw_dir.glob("*/listings.csv.gz")))

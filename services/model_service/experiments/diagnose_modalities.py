@@ -7,27 +7,39 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
+import io
 import json
 from collections import Counter
 from pathlib import Path
 import numpy as np
 from contracts.state import load_state
-from contracts.storage import join_uri, pyarrow_fs_and_path, read_text, uri_exists, write_text
+from contracts.storage import is_s3_uri, join_uri, pyarrow_fs_and_path, read_bytes, read_text, uri_exists, write_text
+
+
+def _open_csv_text(raw_path: str):
+    if is_s3_uri(raw_path):
+        data = read_bytes(raw_path)
+        buf = io.BytesIO(data)
+        stream = gzip.GzipFile(fileobj=buf, mode="rb") if raw_path.endswith(".gz") else buf
+        return io.TextIOWrapper(stream, encoding="utf-8-sig", newline="")
+    path = Path(raw_path)
+    if not path.is_file():
+        path = Path("data/raw/listings.csv")
+    if not path.is_file():
+        return None
+    opener = gzip.open if path.suffix == ".gz" else open
+    return opener(path, "rt", encoding="utf-8-sig", newline="")
 
 
 def raw_profile(state: dict) -> dict:
     counts = Counter()
     descriptions, prices, urls = set(), [], set()
     for source in state.get("sources", []):
-        path = Path(source["path"])
-        if not path.is_file():
-            # Windows paths saved with the original run aren't portable to Linux.
-            path = Path("data/raw/listings.csv")
-        if not path.is_file():
+        stream = _open_csv_text(source["path"])
+        if stream is None:
             continue
-        import gzip
-        opener = gzip.open if path.suffix == ".gz" else open
-        with opener(path, "rt", encoding="utf-8-sig", newline="") as stream:
+        with stream:
             for row in csv.DictReader(stream):
                 counts["rows"] += 1
                 desc = (row.get("description") or "").strip()

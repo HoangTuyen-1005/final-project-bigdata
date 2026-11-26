@@ -30,7 +30,7 @@ class FinalizeRequest(BaseModel):
 class BenchmarkRequest(BaseModel):
     rows: int = Field(default=20000, ge=100)
     partitions: int = Field(default=2, ge=1)
-    out: str = "/tmp/benchmark/20k"
+    out: str = "/data/benchmark/20k"
     explain: bool = False
 
 
